@@ -1,0 +1,5 @@
+claude-agent-sdk>=0.2.164
+python-dotenv>=1.0
+send2trash>=1.8
+pillow>=10
+pystray>=0.19; sys_platform == "win32"
