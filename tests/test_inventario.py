@@ -9,8 +9,10 @@ import pytest
 
 from jarvis import inventario
 from jarvis.inventario import (
+    Acerto,
     Aprovacao,
-    Digitacao,
+    Exclusoes,
+    Importacao,
     ErroInventario,
     Fluxo,
     Inventario,
@@ -19,6 +21,11 @@ from jarvis.inventario import (
     Vigia,
     conferir_estoque,
     documento_do_dia,
+    faixa_da_semana,
+    gravar_csv_do_protheus,
+    gravar_xlsx,
+    normalizar,
+    peneirar,
     e_dia_de_rodar,
     gravar_csv,
     impressao_da_lista,
@@ -32,8 +39,8 @@ from jarvis.inventario import (
 HOJE = date(2026, 10, 23)  # uma sexta
 ESTOQUE = {
     "data": [
-        {"quantity_on_hand": 12.5, "products": {"sku": "ABC-1", "name": "Parafuso", "unit": "PC"}},
-        {"quantity_on_hand": "0", "products": {"sku": "XYZ.2", "name": "Chapa", "unit": "KG"}},
+        {"quantity_on_hand": 12.5, "products": {"sku": "ABC-1", "name": "Parafuso", "unit": "PC", "tags": ["PRODUCAO"]}},
+        {"quantity_on_hand": "0", "products": {"sku": "XYZ.2", "name": "Chapa", "unit": "KG", "tags": ["PRODUCAO"]}},
     ]
 }
 
@@ -126,8 +133,10 @@ def test_lista_acima_do_teto_para_antes_da_tela():
 
 def test_a_linha_sai_no_formato_da_sb7(tmp_path):
     linhas = montar(conferir_estoque(ESTOQUE), HOJE)
-    assert linhas[0].filial == "0101" and linhas[0].local == "02" and linhas[0].documento == "FLX261023"
-    assert linhas[0].como_csv() == "0101;ABC-1;02;FLX261023;12,5;23/10/2026;Parafuso;PC", "decimal com vírgula"
+    assert linhas[0].filial == "0101" and linhas[0].local == "02"
+    # Um documento por linha: documento único para todas foi a tentativa que o Protheus recusou.
+    assert [l.documento for l in linhas] == ["26430001", "26430002"]
+    assert linhas[0].como_csv() == "0101;ABC-1;02;26430001;12,5;23/10/2026;Parafuso;PC", "decimal com vírgula"
     arquivo = gravar_csv(linhas, tmp_path)
     texto = arquivo.read_text(encoding="utf-8-sig")
     assert texto.splitlines()[0] == inventario.CABECALHO_CSV and texto.count(";") == 7 * 3
@@ -143,7 +152,8 @@ def test_de_para_troca_o_codigo_e_confere_o_que_saiu():
 
 def test_documento_e_dias_e_hora():
     assert documento_do_dia(date(2026, 1, 5)) == "FLX260105"
-    assert ler_dias("seg, ter;qua") == ("seg", "ter", "qua") and ler_dias("") == ("seg", "ter", "qua", "qui", "sex")
+    assert faixa_da_semana(date(2026, 10, 30), 2128) == ("2644", "26440001", "26442128")
+    assert ler_dias("seg, ter;qua") == ("seg", "ter", "qua") and ler_dias("") == ("sex",), "semanal, na sexta"
     assert ler_hora("17:00") == (17, 0) and ler_hora(" 9:05 ") == (9, 5)
     for ruim in ("25:00", "17:60", "17h", "", "abc"):
         with pytest.raises(ValueError):
@@ -156,11 +166,11 @@ def test_documento_e_dias_e_hora():
 # --- o dia em disco -------------------------------------------------------------------------
 
 
-def _inventario(tmp_path, rede=None, modo="homologacao", maximo=300, digitacao=None, hoje=HOJE):
+def _inventario(tmp_path, rede=None, modo="homologacao", maximo=300, importacao=None, hoje=HOJE):
     return Inventario(
         Fluxo("https://fluxo.royale.com.br/api", "u", "senha-do-fluxo", pedir=rede or Rede()),
         Registro(tmp_path, hoje=lambda: hoje),
-        modo=modo, maximo=maximo, digitacao=digitacao, hoje=lambda: hoje,
+        modo=modo, maximo=maximo, importacao=importacao, hoje=lambda: hoje,
     )  # fmt: skip
 
 
@@ -168,23 +178,25 @@ def test_monta_o_dia_e_grava_a_pasta(tmp_path):
     alvo = _inventario(tmp_path)
     dia = alvo.montar_o_dia()
     pasta = tmp_path / inventario.PASTA / "2026-10-23"
-    assert dia.estado == "montado" and dia.itens == 2 and dia.documento == "FLX261023"
+    assert dia.estado == "montado" and dia.itens == 2 and dia.faixa == "26430001-26430002"
     assert (pasta / "lista.csv").exists() and (pasta / "execucao.json").exists()
+    assert (pasta / "inventario-2026-10-23.xlsx").exists(), "a planilha do layout SB7"
+    assert (pasta / "inventario-2026-10-23.csv").exists(), "e o CSV que vai para o Protheus"
     assert alvo.registro.ler().itens == 2
 
 
-def test_uma_vez_por_dia_sobrevive_a_reinicio(tmp_path):
-    """Fechar e abrir o Jarvis não devolve o direito de lançar inventário de novo."""
+def test_uma_vez_por_semana_sobrevive_a_reinicio(tmp_path):
+    """É semanal, e o acerto não tem volta: fechar e abrir o Jarvis não devolve o direito."""
     alvo = _inventario(tmp_path)
     dia = alvo.montar_o_dia()
     dia.estado = "concluido"
     alvo.registro.gravar(dia)
     outro = _inventario(tmp_path)  # como se o Jarvis tivesse sido reiniciado
-    with pytest.raises(ErroInventario, match="já foi concluido"):
+    with pytest.raises(ErroInventario, match="já foi feito"):
         outro.montar_o_dia()
 
 
-def test_dia_apenas_montado_ainda_pode_ser_refeito(tmp_path):
+def test_semana_apenas_montada_ainda_pode_ser_refeita(tmp_path):
     """Montar não é lançar: se só montou, pode montar de novo (a lista pode ter mudado)."""
     alvo = _inventario(tmp_path)
     alvo.montar_o_dia()
@@ -213,7 +225,7 @@ def test_a_impressao_muda_quando_qualquer_item_muda():
 
 
 def test_sem_aprovacao_nao_digita(tmp_path):
-    alvo = _inventario(tmp_path, digitacao=Digitacao(roteiro=tmp_path / "existe.yaml"))
+    alvo = _inventario(tmp_path, importacao=Importacao(roteiro=tmp_path / "existe.yaml"))
     (tmp_path / "existe.yaml").write_text("roteiro de mentira", encoding="utf-8")
     alvo.montar_o_dia()
     with pytest.raises(ErroInventario, match="não pedi aprovação"):
@@ -224,29 +236,29 @@ def test_a_pergunta_so_pede_aprovacao_quando_ha_o_que_digitar(tmp_path):
     """Sem roteiro calibrado não existe digitação, então pedir 'sim' seria ritual vazio."""
     alvo = _inventario(tmp_path)
     pergunta = alvo.pergunta(alvo.montar_o_dia())
-    assert "Posso digitar" not in pergunta and "Não digito nada no Protheus ainda" in pergunta
+    assert "Posso importar" not in pergunta and "Não importo nada no Protheus ainda" in pergunta
     assert alvo.aprovacao.pedida_em is None
 
 
 def test_com_roteiro_a_pergunta_pede_aprovacao_e_diz_o_ambiente(tmp_path):
     roteiro = tmp_path / "mata270.yaml"
     roteiro.write_text("campos: []", encoding="utf-8")
-    alvo = _inventario(tmp_path, modo="producao", digitacao=Digitacao(roteiro=roteiro))
+    alvo = _inventario(tmp_path, modo="producao", importacao=Importacao(roteiro=roteiro))
     pergunta = alvo.pergunta(alvo.montar_o_dia())
-    assert "Posso digitar no Protheus de produção" in pergunta and "60 minutos" in pergunta
+    assert "Posso importar no Protheus de produção" in pergunta and "60 minutos" in pergunta
     assert alvo.aprovacao.pedida_em is not None
 
 
 # --- etapa C: a parada ----------------------------------------------------------------------
 
 
-def test_a_digitacao_recusa_e_diz_o_que_falta(tmp_path):
+def test_a_importacao_recusa_e_diz_o_que_falta(tmp_path):
     alvo = _inventario(tmp_path)
     alvo.montar_o_dia()
     alvo.aprovacao.pedir(impressao_da_lista(alvo.linhas))
     with pytest.raises(ErroInventario) as caiu:
         alvo.aprovar()
-    for falta in ("roteiro calibrado", "SmartClient", "usuário do Protheus", "de-para"):
+    for falta in ("roteiro calibrado", "decimal entrou truncado", "Imprimir Browse", "data base"):
         assert falta in str(caiu.value)
     dia = alvo.registro.ler()
     assert dia.estado == "parado" and dia.confirmados == 0
@@ -255,7 +267,7 @@ def test_a_digitacao_recusa_e_diz_o_que_falta(tmp_path):
 
 def test_o_relatorio_lembra_que_o_acerto_nao_foi_feito(tmp_path):
     linhas = montar(conferir_estoque(ESTOQUE), HOJE)
-    dia = inventario.Dia(data=HOJE.isoformat(), estado="parado", itens=2, documento="FLX261023")
+    dia = inventario.Dia(data=HOJE.isoformat(), estado="parado", itens=2, faixa="26430001-26430002")
     arquivo = relatorio(dia, linhas, "homologacao", tmp_path)
     texto = arquivo.read_text(encoding="utf-8")
     assert "MATA340" in texto and "não foi feito" in texto and "ABC-1" in texto
@@ -320,3 +332,145 @@ def test_o_inventario_nao_e_ferramenta_do_modelo():
 
     nomes = " ".join(dir(ferramentas))
     assert "inventario" not in nomes.lower()
+
+
+# --- v2: exclusões, documento por semana, acerto --------------------------------------------
+
+
+def test_exclusoes_saem_por_etiqueta_prefixo_e_codigo():
+    """As regras que o Bruno decidiu na rodada de 24 a 28/10, medidas e não supostas."""
+    itens = [
+        Item("5.01.0255", Decimal(1), etiquetas=("FEIRA",)),
+        Item("FIL-PET-9", Decimal(2), etiquetas=("PRODUCAO",)),
+        Item("3.05.0115", Decimal(3), etiquetas=("PRODUCAO",)),
+        Item("5.01.0300", Decimal(4), etiquetas=("PRODUCAO",)),
+    ]
+    regras = Exclusoes(etiquetas=("FEIRA",), prefixos_sku=("FIL-PET",), codigos_inativos=("3.05.0115",))
+    ficam, fora = peneirar(itens, regras)
+    assert [i.codigo for i in ficam] == ["5.01.0300"]
+    assert fora == {"etiqueta FEIRA": ["5.01.0255"], "prefixo FIL-PET": ["FIL-PET-9"],
+                    "código inativo no Protheus": ["3.05.0115"]}  # fmt: skip
+
+
+def test_etiqueta_compara_sem_acento_e_sem_maiuscula():
+    """INFORMÁTICA = informatica: a etiqueta vem escrita de um jeito no Fluxo e de outro na regra."""
+    assert normalizar(" informática ") == "INFORMATICA"
+    item = conferir_estoque({"data": [{"quantity_on_hand": 1, "products": {"sku": "A", "tags": [{"name": "Informática"}]}}]})[0]
+    assert item.etiquetas == ("INFORMATICA",)
+    _ficam, fora = peneirar([item, Item("B", Decimal(1), etiquetas=("OUTRA",))], Exclusoes(etiquetas=("INFORMATICA",)))
+    assert fora == {"etiqueta INFORMATICA": ["A"]}
+
+
+def test_varias_etiquetas_basta_uma_na_lista():
+    item = Item("A", Decimal(1), etiquetas=("PRODUCAO", "VIAGEM"))
+    _ficam, fora = peneirar([item, Item("B", Decimal(1), etiquetas=("PRODUCAO",))], Exclusoes(etiquetas=("VIAGEM",)))
+    assert list(fora) == ["etiqueta VIAGEM"]
+
+
+def test_sem_etiqueta_nenhuma_no_fluxo_e_erro_e_nao_silencio():
+    """O risco que importa: excluir zero em silêncio poria em produção o que o Bruno tirou."""
+    with pytest.raises(ErroInventario, match="nenhum produto do Fluxo veio com etiqueta"):
+        peneirar([Item("A", Decimal(1)), Item("B", Decimal(2))], Exclusoes(etiquetas=("FEIRA",)))
+    # Sem regra por etiqueta, a ausência dela não é problema.
+    ficam, _fora = peneirar([Item("A", Decimal(1))], Exclusoes(prefixos_sku=("XYZ",)))
+    assert len(ficam) == 1
+
+
+def test_exclusoes_nascem_do_arquivo_e_o_arquivo_e_criado(tmp_path):
+    arquivo = tmp_path / inventario.ARQUIVO_DE_EXCLUSOES
+    regras = Exclusoes.carregar(arquivo)
+    assert arquivo.exists(), "cria com os valores da rodada manual, para o Bruno editar"
+    assert "MIN-TAI" in regras.etiquetas and "FIL-PET" in regras.prefixos_sku
+    assert "3.05.0115" in regras.codigos_inativos
+    arquivo.write_text('{"etiquetas": ["SO ESTA"], "prefixos_sku": []}', encoding="utf-8")
+    assert Exclusoes.carregar(arquivo).etiquetas == ("SO ESTA",), "o arquivo manda, não o padrão"
+    arquivo.write_text("{isso não é json", encoding="utf-8")
+    with pytest.raises(ErroInventario, match="não consegui ler"):
+        Exclusoes.carregar(arquivo)
+    arquivo.write_text('{"etiquetas": "deveria ser lista"}', encoding="utf-8")
+    with pytest.raises(ErroInventario, match="lista de textos"):
+        Exclusoes.carregar(arquivo)
+
+
+def test_tudo_excluido_e_erro():
+    with pytest.raises(ErroInventario, match="tiraram todos"):
+        peneirar([Item("A", Decimal(1), etiquetas=("FEIRA",))], Exclusoes(etiquetas=("FEIRA",)))
+
+
+def test_documento_e_unico_por_linha_e_por_semana():
+    """Mesmo documento para todas falhou em 26/10; faixa reaproveitada misturou com inventário antigo."""
+    uma = montar([Item(f"P{n}", Decimal(1)) for n in range(3)], date(2026, 10, 30))
+    outra = montar([Item("P0", Decimal(1))], date(2026, 11, 6))
+    assert [l.documento for l in uma] == ["26440001", "26440002", "26440003"]
+    assert outra[0].documento == "26450001", "a semana seguinte não repete a faixa"
+    assert len({l.documento for l in uma}) == 3 and len(uma[0].documento) == 8
+    assert faixa_da_semana(date(2026, 1, 2), 5)[0] == "2601", "a virada do ano usa a semana ISO"
+
+
+def test_mais_linhas_do_que_a_sequencia_aguenta_para():
+    with pytest.raises(ErroInventario, match="só vai até"):
+        faixa_da_semana(HOJE, inventario.MAX_LINHAS_NA_SEMANA + 1)
+
+
+def test_a_planilha_sai_no_layout_que_o_protheus_importou(tmp_path):
+    """Produto, armazém e documento como texto: o Excel faria 02 virar 2 e o Protheus recusa."""
+    openpyxl = pytest.importorskip("openpyxl")
+    linhas = montar([Item("5.01.0255", Decimal("62.6"), "Chapa", "KG")], date(2026, 10, 30))
+    arquivo = gravar_xlsx(linhas, tmp_path)
+    folha = openpyxl.load_workbook(arquivo)[inventario.PLANILHA]
+    assert [c.value for c in folha[1]] == list(inventario.CABECALHO_XLSX)
+    assert [c.value for c in folha[2]][:4] == ["5.01.0255", "02", "26440001", 62.6]
+    assert folha["B2"].number_format == "@" and folha["C2"].number_format == "@"
+
+
+def test_o_csv_do_protheus_mantem_o_decimal(tmp_path):
+    """Em 26/10 as quantidades com decimal entraram truncadas: 62,6 não pode virar 62."""
+    linhas = montar([Item("A", Decimal("62.6")), Item("B", Decimal("0.6"))], date(2026, 10, 30))
+    texto = gravar_csv_do_protheus(linhas, tmp_path).read_text(encoding="utf-8-sig")
+    assert "62,6" in texto and "0,6" in texto and texto.startswith("Produto;Armazem;Documento")
+
+
+def test_o_acerto_exige_importacao_antes_e_nao_roda_duas_vezes(tmp_path):
+    """O acerto muda saldo e custo: segunda aprovação, e nunca duas vezes na mesma semana."""
+    alvo = _inventario(tmp_path)
+    dia = alvo.montar_o_dia()
+    with pytest.raises(ErroInventario, match="só depois da importação"):
+        alvo.acertar()
+    dia.estado = "importado"
+    alvo.registro.gravar(dia)
+    with pytest.raises(ErroInventario, match="Não rodo o acerto ainda"):
+        alvo.acertar()
+    dia.acerto_feito = True
+    alvo.registro.gravar(dia)
+    with pytest.raises(ErroInventario, match="já foi feito"):
+        alvo.acertar()
+
+
+def test_a_aprovacao_da_importacao_nao_serve_para_o_acerto(tmp_path):
+    """São dois OK separados: aprovar o arquivo não é aprovar o que mexe em saldo."""
+    alvo = _inventario(tmp_path)
+    alvo.montar_o_dia()
+    alvo.aprovacao.pedir(inventario.impressao_da_lista(alvo.linhas))
+    assert alvo.aprovacao_do_acerto.pedida_em is None
+    assert alvo.aprovacao_do_acerto.vale_para("qualquer")[0] is False
+
+
+def test_semana_com_acerto_feito_bloqueia_a_semana_inteira(tmp_path):
+    """Trava por semana ISO, não por dia: segunda-feira seguinte é outra semana."""
+    alvo = _inventario(tmp_path, hoje=date(2026, 10, 30))  # sexta, semana 44
+    dia = alvo.montar_o_dia()
+    dia.acerto_feito = True
+    alvo.registro.gravar(dia)
+    mesma_semana = _inventario(tmp_path, hoje=date(2026, 10, 31))  # sábado, ainda semana 44
+    with pytest.raises(ErroInventario, match="já foi feito"):
+        mesma_semana.montar_o_dia()
+    outra = _inventario(tmp_path, hoje=date(2026, 11, 6))  # sexta seguinte, semana 45
+    assert outra.montar_o_dia().faixa.startswith("2645")
+
+
+def test_o_relatorio_mostra_quem_saiu_por_cada_regra(tmp_path):
+    linhas = montar(conferir_estoque(ESTOQUE), HOJE)
+    dia = inventario.Dia(data=HOJE.isoformat(), estado="montado", itens=2)
+    texto = inventario.relatorio(dia, linhas, "homologacao", tmp_path,
+                                 {"etiqueta FEIRA": ["A", "B"], "prefixo FIL-PET": ["C"]}).read_text(encoding="utf-8")  # fmt: skip
+    assert "etiqueta FEIRA** — 2" in texto and "prefixo FIL-PET** — 1" in texto

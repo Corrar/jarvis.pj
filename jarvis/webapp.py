@@ -332,17 +332,20 @@ class Navegador:
 
     async def _subir(self, extras: Sequence[str], minimo: bool = False, canal: str = "", escondido: bool = False) -> None:
         """Uma tentativa: sobe o navegador com estes ajustes e abre o endereço."""
-        try:
-            # A API assíncrona, não a síncrona: o Jarvis roda em asyncio, e a síncrona recusa
-            # funcionar dentro de um laço asyncio — estouraria na primeira execução de verdade.
-            from playwright.async_api import async_playwright
-        except ImportError:
-            raise ErroWebApp(
-                "falta a biblioteca do navegador. Na pasta do Jarvis, rode: "
-                r".\.venv\Scripts\python.exe -m pip install -r requirements-calibracao.txt "
-                r"e depois .\.venv\Scripts\python.exe -m playwright install chromium"
-            ) from None
-        self._pw = await (self._abrir or async_playwright)().start()
+        abrir = self._abrir
+        if abrir is None:  # com um driver injetado, a biblioteca de verdade não é necessária
+            try:
+                # A API assíncrona, não a síncrona: o Jarvis roda em asyncio, e a síncrona recusa
+                # funcionar dentro de um laço asyncio — estouraria na primeira execução de verdade.
+                from playwright.async_api import async_playwright
+            except ImportError:
+                raise ErroWebApp(
+                    "falta a biblioteca do navegador. Na pasta do Jarvis, rode: "
+                    r".\.venv\Scripts\python.exe -m pip install -r requirements-calibracao.txt "
+                    r"e depois .\.venv\Scripts\python.exe -m playwright install chromium"
+                ) from None
+            abrir = async_playwright
+        self._pw = await abrir().start()
         self.perfil.mkdir(parents=True, exist_ok=True)
         base = [] if minimo else [
             "--no-first-run", "--no-default-browser-check", "--no-service-autorun",

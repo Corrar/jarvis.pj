@@ -329,16 +329,29 @@ A lista de programas já traz calculadora, bloco de notas, explorador de arquivo
 
 **Se preferir aprovar cada ação**, ponha `JARVIS_CONFIRMAR=sempre` no `.env`. O terminal passa a mostrar a ação e só executa com `s` ou `sim`; qualquer outra resposta, ou 90 segundos sem resposta, cancela.
 
-## Inventário diário Fluxo → Protheus
+## Inventário semanal Fluxo → Protheus
 
-Todo dia útil às 17:00 (ajustável), o Jarvis lê o estoque do Fluxo Royale, monta a lista do
-inventário no formato da SB7 e grava em `Documentos\Inventario-Fluxo\AAAA-MM-DD\`: `lista.csv`
-(separador `;`, decimal com vírgula), `execucao.json` e `relatorio.md`. `/inventario` mostra a
-situação, `/inventario montar` roda na hora, `/inventario aprovar` libera a digitação.
+Toda sexta às 17:00 (ajustável), o Jarvis lê o estoque do Fluxo Royale, tira os produtos das regras
+de exclusão, monta o arquivo no layout SB7 e grava em `Documentos\Inventario-Fluxo\AAAA-MM-DD\`:
+a planilha `.xlsx` (aba `Plan1`), o `.csv` que vai para o Protheus, o `lista.csv` de conferência,
+`execucao.json` e `relatorio.md`. `/inventario` mostra a situação, `/inventario montar` roda na
+hora, `/inventario aprovar` libera a importação e `/inventario acertar` é a **segunda** aprovação,
+só para o acerto.
 
-**A digitação na MATA270 ainda não existe**, de propósito: sem o roteiro calibrado da tela não há o
-que digitar, e errar ali escreve lançamento torto no inventário de produção. Ele monta a lista,
-avisa e para, dizendo o que falta.
+**Um documento por linha**, no formato `AA` + semana ISO + 4 dígitos (`26440001`). Documento único
+para todas as linhas foi recusado pelo Protheus, e faixa reaproveitada misturou o inventário com um
+antigo. A faixa de uma semana não repete na seguinte nem no ano que vem.
+
+**Exclusões** em `Inventario-Fluxo\inventario-exclusoes.json`, que você edita: por etiqueta (sem
+diferenciar maiúscula nem acento), por prefixo de SKU e por código inativo ou sem cadastro no
+Protheus. O relatório mostra quantos saíram por cada regra. Se as regras usam etiqueta e nenhum
+produto do Fluxo trouxer etiqueta, ele **para** em vez de excluir zero em silêncio — seria o jeito
+de mandar para produção justamente o que você tirou.
+
+**A importação na MATA270 e o acerto (MATA340) ainda não existem**, de propósito: sem o roteiro
+calibrado não há o que clicar, e errar ali escreve inventário torto em produção. Ele monta o
+arquivo, avisa e para, dizendo o que falta. Mesmo depois de calibrado, o acerto preenche, confere,
+mostra e para — o clique final é seu.
 
 O que protege, pelo código:
 
@@ -349,7 +362,8 @@ O que protege, pelo código:
 - **O token não fica guardado** e a senha nunca aparece em mensagem, relatório ou log.
 - **Barreiras antes de qualquer tela:** falha de login, estoque vazio, SKU vazio, repetido ou com
   caractere estranho, quantidade negativa ou não numérica, lista acima do teto.
-- **Uma vez por dia, gravado em disco:** reiniciar o Jarvis não devolve o direito de lançar.
+- **Uma vez por semana, gravado em disco:** reiniciar o Jarvis não devolve o direito de lançar, e
+  o acerto, que não tem volta, nunca roda duas vezes na mesma semana.
 - **O "sim" é digitado ou clicado, nunca só falado.** Ele pergunta pela voz; a resposta vem pela
   mão. Televisão, colega na sala e o próprio alto-falante produzem um "sim"; um `s` digitado não.
 - **O acerto (MATA340) não é feito**, e o relatório lembra disso todo dia: é com o fiscal.

@@ -1349,7 +1349,14 @@ async def tratar_inventario(alvo: Any, pedido: str, voz: Any = None) -> None:
         except inventario.ErroInventario as erro:
             print(f"[inventário] {erro}")
         return
-    print("Use: /inventario (situação), /inventario montar, /inventario aprovar.")
+    if pedido in ("acertar", "acerto"):
+        # A segunda aprovação, à parte da primeira: o acerto muda saldo e custo e não tem volta.
+        try:
+            print("[inventário] " + await asyncio.to_thread(alvo.acertar))
+        except inventario.ErroInventario as erro:
+            print(f"[inventário] {erro}")
+        return
+    print("Use: /inventario (situação), /inventario montar, /inventario aprovar, /inventario acertar.")
 
 
 def mostrar_ajustes(cfg: Config, voz: Any = None) -> None:

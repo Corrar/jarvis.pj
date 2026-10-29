@@ -52,7 +52,7 @@ class Config:
     # `homologacao` primeiro, e só passar para `producao` depois do aceite (§9 da especificação).
     inv_modo: str = "desligado"
     inv_hora: str = "17:00"
-    inv_dias: tuple[str, ...] = ("seg", "ter", "qua", "qui", "sex")
+    inv_dias: tuple[str, ...] = ("sex",)  # semanal, na sexta (v2 da especificação)
     inv_max_itens: int = 300
     fluxo_url: str = ""
     fluxo_usuario: str = ""

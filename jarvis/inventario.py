@@ -36,6 +36,21 @@ from jarvis.protheus import MASCARA, _SemDesvio, mascarar_texto
 log = logging.getLogger(__name__)
 
 PASTA = "Inventario-Fluxo"
+ARQUIVO_DE_EXCLUSOES = "inventario-exclusoes.json"
+PLANILHA = "Plan1"
+CABECALHO_XLSX = ("Produto", "Armazem", "Documento", "Quantidade", "Data")
+MAX_LINHAS_NA_SEMANA = 9999  # a sequência do documento tem 4 dígitos
+# Os valores que o Bruno decidiu na rodada manual de 24 a 28/10/2026. O arquivo em disco manda.
+EXCLUSOES_PADRAO = {
+    "etiquetas": ["MIN-TAI", "INFORMATICA", "FEIRA", "VIAGEM", "FERRAMENTAS", "INSUMOS", "DESPESAS", "CAMISETA"],
+    "prefixos_sku": ["FIL-PET"],
+    "codigos_inativos_protheus": ["3.05.0115", "3.08.0113", "3.09.0338", "5.01.0250"],
+    "codigos_sem_cadastro_protheus": [],
+}
+# Onde a etiqueta pode estar na resposta do Fluxo. Não sei o nome que ela tem lá, então procuro em
+# todos e, se não achar nenhum com a lista de etiquetas ligada, PARO: aplicar zero exclusão em
+# silêncio poria no inventário de produção justamente o que o Bruno mandou tirar.
+CAMPOS_DE_ETIQUETA = ("tags", "labels", "etiquetas", "categories", "categorias", "product_tags", "grupos")
 ARMAZEM = "02"  # ALMOX; o Fluxo só devolve este, e é o que o Protheus chama de ALMOXARIFADO
 FILIAL = "0101"
 PREFIXO_DO_DOCUMENTO = "FLX"
@@ -62,6 +77,14 @@ class ErroInventario(Exception):
     """Qualquer coisa que impeça o inventário do dia. A mensagem é para o Bruno ler."""
 
 
+def normalizar(texto: Any) -> str:
+    """Para comparar etiqueta: sem acento, sem maiúscula, sem espaço nas pontas (INFORMÁTICA = informatica)."""
+    import unicodedata
+
+    cru = unicodedata.normalize("NFKD", str(texto or "")).encode("ascii", "ignore").decode("ascii")
+    return cru.strip().upper()
+
+
 @dataclass(frozen=True)
 class Item:
     """Uma linha do estoque do Fluxo, já conferida."""
@@ -70,6 +93,7 @@ class Item:
     quantidade: Decimal
     nome: str = ""
     unidade: str = ""
+    etiquetas: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -107,7 +131,7 @@ def ler_dias(bruto: str) -> tuple[str, ...]:
     for dia in pedidos:
         if dia not in DIAS:
             raise ValueError(f"JARVIS_INV_DIAS: '{dia}' não é dia da semana. Use: {', '.join(DIAS)}.")
-    return tuple(dict.fromkeys(pedidos)) or DIAS[:5]
+    return tuple(dict.fromkeys(pedidos)) or ("sex",)  # semanal, na sexta
 
 
 def ler_hora(bruto: str) -> tuple[int, int]:
@@ -220,6 +244,23 @@ def _quantidade(bruto: Any, onde: str) -> Decimal:
     return valor
 
 
+def _etiquetas(produto: dict[str, Any], linha: dict[str, Any]) -> tuple[str, ...]:
+    """As etiquetas do produto, venham no nome que vierem, como texto comparável."""
+    achadas: list[str] = []
+    for fonte in (produto, linha):
+        for campo in CAMPOS_DE_ETIQUETA:
+            bruto = fonte.get(campo)
+            if bruto is None:
+                continue
+            valores = bruto if isinstance(bruto, (list, tuple)) else [bruto]
+            for valor in valores:
+                if isinstance(valor, dict):  # [{"name": "FEIRA"}] é tão comum quanto ["FEIRA"]
+                    valor = valor.get("name") or valor.get("nome") or valor.get("label") or valor.get("title")
+                if isinstance(valor, str) and valor.strip():
+                    achadas.append(normalizar(valor))
+    return tuple(dict.fromkeys(achadas))
+
+
 def conferir_estoque(dados: Any) -> list[Item]:
     """As barreiras da etapa A, sobre o que o Fluxo devolveu."""
     linhas = dados.get("data") if isinstance(dados, dict) else dados
@@ -251,24 +292,176 @@ def conferir_estoque(dados: Any) -> list[Item]:
                 quantidade=_quantidade(bruta.get("quantity_on_hand"), f"linha {numero} ({codigo})"),
                 nome=str(produto.get("name") or "").strip()[:80],
                 unidade=str(produto.get("unit") or "").strip()[:10],
+                etiquetas=_etiquetas(produto, bruta),
             )
         )
     return itens
 
 
-def montar(itens: Sequence[Item], dia: date, armazem: str = ARMAZEM, filial: str = FILIAL, de_para: dict[str, str] | None = None) -> list[Linha]:
-    """Do estoque do Fluxo para as linhas da SB7. `de_para` é o SKU → B1_COD, quando houver (P-5)."""
-    documento = documento_do_dia(dia)
-    saida = []
+@dataclass
+class Exclusoes:
+    """As regras do Bruno para o que não entra no inventário. Editáveis no arquivo JSON."""
+
+    etiquetas: tuple[str, ...] = ()
+    prefixos_sku: tuple[str, ...] = ()
+    codigos_inativos: tuple[str, ...] = ()
+    codigos_sem_cadastro: tuple[str, ...] = ()
+
+    @classmethod
+    def carregar(cls, arquivo: Path) -> Exclusoes:
+        """Lê o arquivo; se não existir, cria com os valores da rodada de 24 a 28/10 e usa esses."""
+        try:
+            bruto = json.loads(arquivo.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            arquivo.parent.mkdir(parents=True, exist_ok=True)
+            arquivo.write_text(json.dumps(EXCLUSOES_PADRAO, ensure_ascii=False, indent=2), encoding="utf-8")
+            bruto = dict(EXCLUSOES_PADRAO)
+        except (OSError, ValueError) as erro:
+            raise ErroInventario(
+                f"não consegui ler {arquivo.name}: {erro}. Conserte o arquivo ou apague-o para eu recriar."
+            ) from None
+        if not isinstance(bruto, dict):
+            raise ErroInventario(f"{arquivo.name} precisa ser um objeto JSON com as listas de exclusão.")
+
+        def lista(nome: str) -> tuple[str, ...]:
+            valores = bruto.get(nome, [])
+            if not isinstance(valores, list) or any(not isinstance(v, str) for v in valores):
+                raise ErroInventario(f"{arquivo.name}: '{nome}' precisa ser uma lista de textos.")
+            return tuple(v.strip() for v in valores if v.strip())
+
+        return cls(
+            etiquetas=tuple(normalizar(e) for e in lista("etiquetas")),
+            prefixos_sku=tuple(normalizar(p) for p in lista("prefixos_sku")),
+            codigos_inativos=lista("codigos_inativos_protheus"),
+            codigos_sem_cadastro=lista("codigos_sem_cadastro_protheus"),
+        )
+
+    @property
+    def usa_etiqueta(self) -> bool:
+        return bool(self.etiquetas)
+
+    def motivo(self, item: Item) -> str:
+        """Por que este item não entra, ou vazio se entra."""
+        for etiqueta in self.etiquetas:
+            if etiqueta in item.etiquetas:
+                return f"etiqueta {etiqueta}"
+        codigo = normalizar(item.codigo)
+        for prefixo in self.prefixos_sku:
+            if codigo.startswith(prefixo):
+                return f"prefixo {prefixo}"
+        if item.codigo in self.codigos_inativos:
+            return "código inativo no Protheus"
+        if item.codigo in self.codigos_sem_cadastro:
+            return "código sem cadastro no Protheus"
+        return ""
+
+
+def peneirar(itens: Sequence[Item], exclusoes: Exclusoes) -> tuple[list[Item], dict[str, list[str]]]:
+    """Separa o que entra do que sai, com a lista de quem saiu por cada regra.
+
+    Se há regra por etiqueta mas nenhum produto do Fluxo trouxe etiqueta nenhuma, isto é erro, não
+    resultado: significa que eu não sei ler a etiqueta nessa resposta, e seguir poria no inventário
+    de produção justamente o que o Bruno mandou tirar.
+    """
+    if exclusoes.usa_etiqueta and not any(item.etiquetas for item in itens):
+        raise ErroInventario(
+            "as regras de exclusão usam etiqueta, mas nenhum produto do Fluxo veio com etiqueta. "
+            f"Eu procuro nos campos {', '.join(CAMPOS_DE_ETIQUETA)}. Ou a rota /stock não manda a etiqueta, "
+            "ou ela tem outro nome: descubra qual e me diga, porque sem isso eu excluiria zero produto "
+            "sem avisar e o inventário iria com o que deveria ficar de fora."
+        )
+    mantidos: list[Item] = []
+    fora: dict[str, list[str]] = {}
     for item in itens:
+        motivo = exclusoes.motivo(item)
+        if motivo:
+            fora.setdefault(motivo, []).append(item.codigo)
+        else:
+            mantidos.append(item)
+    if not mantidos:
+        raise ErroInventario("as exclusões tiraram todos os produtos. Confira o inventario-exclusoes.json antes de seguir.")
+    return mantidos, fora
+
+
+def faixa_da_semana(dia: date, quantas: int) -> tuple[str, str, str]:
+    """O prefixo do documento e a faixa da semana: `AA` + semana ISO + sequência de 4 dígitos.
+
+    São 8 caracteres, como os que o Protheus aceitou, e não repetem entre semanas nem entre anos.
+    """
+    if quantas < 1:
+        raise ErroInventario("não há linha nenhuma para numerar.")
+    if quantas > MAX_LINHAS_NA_SEMANA:
+        raise ErroInventario(
+            f"são {quantas} linhas e a sequência do documento só vai até {MAX_LINHAS_NA_SEMANA}. "
+            "Pare e me avise: mudar a regra do documento é decisão sua, não minha."
+        )
+    ano, semana, _dia_da_semana = dia.isocalendar()
+    prefixo = f"{ano % 100:02d}{semana:02d}"
+    return prefixo, f"{prefixo}0001", f"{prefixo}{quantas:04d}"
+
+
+def montar(itens: Sequence[Item], dia: date, armazem: str = ARMAZEM, filial: str = FILIAL, de_para: dict[str, str] | None = None) -> list[Linha]:
+    """Do estoque do Fluxo para as linhas da SB7, **um documento por linha**.
+
+    Documento único para todas as linhas foi a tentativa que o Protheus recusou na rodada de 26/10.
+    """
+    prefixo, _inicio, _fim = faixa_da_semana(dia, len(itens))
+    saida = []
+    for numero, item in enumerate(itens, 1):
         codigo = (de_para or {}).get(item.codigo, item.codigo)
         if not _SKU.match(codigo):
-            raise ErroInventario(f"o de-para transformou {item.codigo} em '{codigo[:30]}', que eu não digito numa tela de produção.")
+            raise ErroInventario(f"o de-para transformou {item.codigo} em '{codigo[:30]}', que eu não ponho num arquivo de produção.")
         saida.append(
-            Linha(filial=filial, codigo=codigo, local=armazem, documento=documento,
+            Linha(filial=filial, codigo=codigo, local=armazem, documento=f"{prefixo}{numero:04d}",
                   quantidade=item.quantidade, data=dia, nome=item.nome, unidade=item.unidade)
         )  # fmt: skip
     return saida
+
+
+def gravar_xlsx(linhas: Sequence[Linha], pasta: Path) -> Path:
+    """A planilha no layout SB7 que o Protheus importou: `Plan1`, cabeçalho na linha 1.
+
+    Produto, Armazém e Documento vão como **texto**: o Excel transformaria `02` em `2` e
+    `26440001` em número, e o Protheus recusa os dois.
+    """
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        raise ErroInventario(
+            "falta a biblioteca da planilha. Na pasta do Jarvis, rode: "
+            r".\.venv\Scripts\python.exe -m pip install -r requirements.txt"
+        ) from None
+    livro = Workbook()
+    folha = livro.active
+    folha.title = PLANILHA
+    folha.append(list(CABECALHO_XLSX))
+    for linha in linhas:
+        folha.append([linha.codigo, linha.local, linha.documento, float(linha.quantidade), linha.data])
+        atual = folha.max_row
+        for coluna in ("A", "B", "C"):
+            folha[f"{coluna}{atual}"].number_format = "@"  # texto
+        folha[f"E{atual}"].number_format = "DD/MM/YYYY"
+    pasta.mkdir(parents=True, exist_ok=True)
+    arquivo = pasta / f"inventario-{linhas[0].data:%Y-%m-%d}.xlsx" if linhas else pasta / "inventario.xlsx"
+    livro.save(arquivo)
+    return arquivo
+
+
+def gravar_csv_do_protheus(linhas: Sequence[Linha], pasta: Path) -> Path:
+    """O CSV no mesmo formato do 'Salvar como' do Excel em português: `;` e decimal com vírgula.
+
+    ⚠ Na rodada de 26/10 as quantidades com decimal entraram truncadas (62,6 virou 62). Se foi a
+    vírgula, é aqui que se resolve — e é item da calibração. Até lá, a conferência da importação é
+    que pega, e o relatório avisa.
+    """
+    pasta.mkdir(parents=True, exist_ok=True)
+    arquivo = pasta / f"inventario-{linhas[0].data:%Y-%m-%d}.csv" if linhas else pasta / "inventario.csv"
+    corpo = [";".join(CABECALHO_XLSX)]
+    for linha in linhas:
+        quantidade = f"{linha.quantidade:f}".replace(".", ",")
+        corpo.append(";".join((linha.codigo, linha.local, linha.documento, quantidade, f"{linha.data:%d/%m/%Y}")))
+    arquivo.write_text("\r\n".join(corpo) + "\r\n", encoding="utf-8-sig")
+    return arquivo
 
 
 def conferir_tamanho(linhas: Sequence[Linha], maximo: int) -> None:
@@ -308,6 +501,8 @@ class Dia:
     itens: int = 0
     documento: str = ""
     confirmados: int = 0
+    faixa: str = ""  # a faixa de documentos da semana, que o acerto precisa reescrever
+    acerto_feito: bool = False
     motivo: str = ""
     pedido_em: str = ""
     passos: list[str] = field(default_factory=list)
@@ -315,7 +510,8 @@ class Dia:
     def como_json(self) -> dict[str, Any]:
         return {
             "data": self.data, "estado": self.estado, "itens": self.itens, "documento": self.documento,
-            "confirmados": self.confirmados, "motivo": self.motivo, "pedido_em": self.pedido_em,
+            "confirmados": self.confirmados, "faixa": self.faixa, "acerto_feito": self.acerto_feito,
+            "motivo": self.motivo, "pedido_em": self.pedido_em,
             "passos": self.passos[-200:],
         }  # fmt: skip
 
@@ -341,13 +537,34 @@ class Registro:
             return None
         return Dia(**{campo: dados.get(campo, padrao) for campo, padrao in (
             ("data", ""), ("estado", "montado"), ("itens", 0), ("documento", ""),
-            ("confirmados", 0), ("motivo", ""), ("pedido_em", ""), ("passos", []),
+            ("confirmados", 0), ("faixa", ""), ("acerto_feito", False),
+            ("motivo", ""), ("pedido_em", ""), ("passos", []),
         )})  # fmt: skip
 
     def gravar(self, dia: Dia) -> None:
         arquivo = self._arquivo(date.fromisoformat(dia.data))
         arquivo.parent.mkdir(parents=True, exist_ok=True)
         arquivo.write_text(json.dumps(dia.como_json(), ensure_ascii=False, indent=1), encoding="utf-8")
+
+    def ja_rodou_na_semana(self, dia: date | None = None) -> Dia | None:
+        """O inventário desta semana ISO, se já foi feito. O acerto não tem volta: duas vezes, não."""
+        alvo = (dia or self._hoje()).isocalendar()[:2]
+        pasta = self.raiz / PASTA
+        try:
+            nomes = sorted((p.name for p in pasta.iterdir() if p.is_dir()), reverse=True)[:30]
+        except OSError:
+            return None
+        for nome in nomes:
+            try:
+                quando = date.fromisoformat(nome)
+            except ValueError:
+                continue
+            if quando.isocalendar()[:2] != alvo:
+                continue
+            anterior = self.ler(quando)
+            if anterior is not None and (anterior.acerto_feito or anterior.estado in ("concluido", "parado")):
+                return anterior
+        return None
 
     def ja_rodou_hoje(self) -> Dia | None:
         """A execução de hoje, se já terminou (concluída ou parada). `None` se ainda cabe rodar."""
@@ -397,24 +614,24 @@ def impressao_da_lista(linhas: Sequence[Linha]) -> str:
 # ------------------------------------------------------------------------------- etapa C
 
 
-class Digitacao:
-    """A digitação na MATA270. Ainda não existe, e recusa dizendo exatamente o que falta.
+class Importacao:
+    """A importação do arquivo na MATA270. Ainda não existe, e recusa dizendo o que falta.
 
-    Não é cautela de fachada: sem o roteiro calibrado não há o que digitar. Os nomes e a ordem dos
-    campos, o caminho do menu, quais campos são obrigatórios, se cada item grava ao confirmar e
-    quais mensagens são normais — nada disso dá para adivinhar de fora, e errar aqui escreve
-    lançamento torto no inventário de produção.
+    Não é cautela de fachada: sem o roteiro calibrado não há o que clicar. O caminho do menu, os
+    seis parâmetros do F12, onde fica Outras Ações > Outros > Importar e qual tipo de CSV o layout
+    SB7 aceita — nada disso dá para adivinhar de fora, e errar aqui escreve inventário torto em
+    produção.
     """
 
     FALTA = (
-        "o roteiro calibrado da tela (roteiros/mata270.yaml)",
-        "a resposta sobre SmartClient instalado ou navegador, que muda como eu leio a tela",
-        "o usuário do Protheus que eu devo usar (P-3)",
-        "o de-para SKU → B1_COD, ou a confirmação de que o B7_COD aceita o SKU do Fluxo (P-5)",
+        "o roteiro calibrado da MATA270 (caminho do menu, parâmetros do F12, o botão Importar)",
+        "qual tipo de CSV o layout SB7 aceita, e por que o decimal entrou truncado em 26/10",
+        "como baixar o PDF do Imprimir Browse pelo navegador controlado",
+        "se a data base pode ser trocada para a sexta pelo usuário do Jarvis",
     )
 
-    def __init__(self, modo: str = "desligado", roteiro: Path | None = None) -> None:
-        self.modo, self.roteiro = modo, roteiro
+    def __init__(self, roteiro: Path | None = None) -> None:
+        self.roteiro = roteiro
 
     @property
     def pronta(self) -> bool:
@@ -422,12 +639,38 @@ class Digitacao:
 
     def recusa(self) -> str:
         return (
-            "Não digito nada no Protheus ainda. Falta: "
-            + "; ".join(self.FALTA)
-            + ". A lista do dia está pronta e conferida na pasta do dia — dá para importar ou digitar à mão por ela."
+            "Não importo nada no Protheus ainda. Falta: " + "; ".join(self.FALTA)
+            + ". O arquivo da semana está pronto e conferido na pasta — dá para importar à mão por ele."
         )
 
     def executar(self, linhas: Sequence[Linha]) -> None:
+        raise ErroInventario(self.recusa())
+
+
+class Acerto:
+    """O acerto (MATA340). Além de não existir, é o passo que não tem volta.
+
+    Ele gera requisições e devoluções que mudam saldo e custo. Mesmo depois de calibrado, o Jarvis
+    preenche, confere, mostra e **para**: o clique final é do Bruno, com a segunda aprovação
+    digitada. E a faixa de documentos fica gravada da execução anterior — em 28/10 estava numa de
+    junho —, então ela é sempre reescrita e lida de volta.
+    """
+
+    def __init__(self, roteiro: Path | None = None) -> None:
+        self.roteiro = roteiro
+
+    @property
+    def pronto(self) -> bool:
+        return bool(self.roteiro and self.roteiro.exists())
+
+    def recusa(self) -> str:
+        return (
+            "Não rodo o acerto ainda: falta o roteiro calibrado da MATA340, e o acerto não tem volta. "
+            "Quando existir, eu preencho os parâmetros, reescrevo a faixa de documentos da semana, "
+            "mostro a tela e paro — o clique é seu."
+        )
+
+    def executar(self, dia: Dia) -> None:
         raise ErroInventario(self.recusa())
 
 
@@ -471,32 +714,40 @@ class Vigia:
             try:
                 self.conferir()
             except Exception:  # noqa: BLE001 - o relógio não pode morrer por causa de uma execução
-                log.exception("Falha ao disparar o inventário do dia")
+                log.exception("Falha ao disparar o inventário da semana")
             await asyncio.sleep(intervalo)
 
 
-def relatorio(dia: Dia, linhas: Sequence[Linha], modo: str, pasta: Path) -> Path:
-    """O relatório do dia, em Markdown, na pasta do dia."""
+def relatorio(dia: Dia, linhas: Sequence[Linha], modo: str, pasta: Path, fora: dict[str, list[str]] | None = None) -> Path:
+    """O relatório da semana, em Markdown, na pasta do dia."""
     agora = datetime.now()
     partes = [
-        f"# Inventário Fluxo → Protheus — {dia.data}",
+        f"# Inventário semanal Fluxo → Protheus — {dia.data}",
         "",
         f"- Modo: **{modo}**",
-        f"- Documento: **{dia.documento or '—'}**",
-        f"- Itens na lista: **{dia.itens}**",
-        f"- Confirmados no Protheus: **{dia.confirmados}**",
+        f"- Faixa de documentos: **{dia.faixa or '—'}**",
+        f"- Linhas no arquivo: **{dia.itens}**",
+        f"- Importadas e conferidas: **{dia.confirmados}**",
         f"- Estado: **{dia.estado}**",
+        f"- Acerto (MATA340): **{'feito' if dia.acerto_feito else 'NÃO feito'}**",
     ]
     if dia.motivo:
         partes.append(f"- Motivo: {dia.motivo}")
-    partes += ["", "## Lembrete", "", "O acerto de inventário (MATA340) **não foi feito**: isso é com o fiscal ou o almoxarifado, na mão.", ""]
+    if fora:
+        partes += ["", "## Produtos fora do inventário, por regra", ""]
+        for motivo, codigos in sorted(fora.items()):
+            partes.append(f"- **{motivo}** — {len(codigos)}: {', '.join(codigos[:40])}" + (" …" if len(codigos) > 40 else ""))
+        partes.append("")
+    if not dia.acerto_feito:
+        partes += ["", "## Lembrete", "",
+                   "O acerto (MATA340) **não foi feito**: ele muda saldo e custo e precisa da sua segunda aprovação.", ""]  # fmt: skip
     if dia.passos:
         partes += ["## Passos", "", *(f"- {passo}" for passo in dia.passos[-60:]), ""]
     if linhas:
-        partes += ["## Primeiros itens", "", "| Produto | Quantidade | Armazém |", "|---|---|---|"]
-        partes += [f"| {l.codigo} | {l.quantidade:f} | {l.local} |" for l in linhas[:20]]
+        partes += ["## Primeiras linhas", "", "| Produto | Documento | Quantidade | Armazém |", "|---|---|---|---|"]
+        partes += [f"| {l.codigo} | {l.documento} | {l.quantidade:f} | {l.local} |" for l in linhas[:20]]
         if len(linhas) > 20:
-            partes.append(f"| … | mais {len(linhas) - 20} itens no lista.csv | |")
+            partes.append(f"| … | mais {len(linhas) - 20} linhas no arquivo | | |")
         partes.append("")
     partes.append(f"_Gerado em {agora:%d/%m/%Y %H:%M}._")
     pasta.mkdir(parents=True, exist_ok=True)
@@ -506,7 +757,7 @@ def relatorio(dia: Dia, linhas: Sequence[Linha], modo: str, pasta: Path) -> Path
 
 
 class Inventario:
-    """Junta as peças: lê o Fluxo, monta, grava a pasta do dia e segura o dia em disco."""
+    """Junta as peças da semana: lê o Fluxo, peneira, monta o arquivo e segura o que não tem volta."""
 
     def __init__(
         self,
@@ -514,78 +765,128 @@ class Inventario:
         registro: Registro,
         modo: str = "desligado",
         maximo: int = MAX_ITENS,
-        digitacao: Digitacao | None = None,
+        importacao: Importacao | None = None,
+        acerto: Acerto | None = None,
         hoje: Callable[[], date] = date.today,
     ) -> None:
         self.fluxo, self.registro, self.modo, self.maximo = fluxo, registro, modo, maximo
-        self.digitacao = digitacao or Digitacao(modo)
+        self.importacao = importacao or Importacao()
+        self.acerto = acerto or Acerto()
         self._hoje = hoje
         self.aprovacao = Aprovacao()
+        self.aprovacao_do_acerto = Aprovacao()
         self.linhas: list[Linha] = []
+        self.fora: dict[str, list[str]] = {}
 
     @property
     def ligado(self) -> bool:
         return self.modo != "desligado"
 
+    @property
+    def arquivo_de_exclusoes(self) -> Path:
+        return self.registro.raiz / PASTA / ARQUIVO_DE_EXCLUSOES
+
     def montar_o_dia(self) -> Dia:
-        """Etapa A inteira: lê, confere, monta, grava a pasta do dia. Não encosta na tela."""
+        """Etapa A da v2: lê, peneira, numera e grava o arquivo da semana. Não encosta na tela."""
         hoje = self._hoje()
-        ja = self.registro.ja_rodou_hoje()
+        ja = self.registro.ja_rodou_na_semana(hoje)
         if ja is not None:
-            raise ErroInventario(f"o inventário de hoje já foi {ja.estado} ({ja.itens} itens, documento {ja.documento}). Não rodo de novo no mesmo dia.")
+            feito = "com acerto" if ja.acerto_feito else ja.estado
+            raise ErroInventario(
+                f"o inventário desta semana já foi feito em {ja.data} ({feito}, {ja.itens} itens, faixa {ja.faixa}). "
+                "É semanal, e o acerto não tem volta: não rodo de novo."
+            )
+        exclusoes = Exclusoes.carregar(self.arquivo_de_exclusoes)
         itens = self.fluxo.estoque()
-        self.linhas = montar(itens, hoje)
+        mantidos, self.fora = peneirar(itens, exclusoes)
+        self.linhas = montar(mantidos, hoje)
         conferir_tamanho(self.linhas, self.maximo)
         pasta = self.registro.pasta_do_dia(hoje)
-        gravar_csv(self.linhas, pasta)
+        gravar_csv(self.linhas, pasta)  # o CSV simples, para você conferir
+        gravar_xlsx(self.linhas, pasta)
+        gravar_csv_do_protheus(self.linhas, pasta)
+        _prefixo, inicio, fim = faixa_da_semana(hoje, len(self.linhas))
         dia = Dia(data=hoje.isoformat(), estado="montado", itens=len(self.linhas),
-                  documento=self.linhas[0].documento if self.linhas else "")  # fmt: skip
-        dia.passos.append(f"{datetime.now():%H:%M} lista montada: {resumir(self.linhas)}")
+                  faixa=f"{inicio}-{fim}", documento=inicio)  # fmt: skip
+        dia.passos.append(f"{datetime.now():%H:%M} arquivo montado: {resumir(self.linhas)}")
+        for motivo, codigos in sorted(self.fora.items()):
+            dia.passos.append(f"{datetime.now():%H:%M} fora por {motivo}: {len(codigos)} item(ns)")
         self.registro.gravar(dia)
         return dia
 
+    def texto_das_exclusoes(self) -> str:
+        if not self.fora:
+            return "Nenhum produto saiu pelas regras de exclusão."
+        partes = [f"{len(c)} por {m}" for m, c in sorted(self.fora.items())]
+        total = sum(len(c) for c in self.fora.values())
+        return f"{total} produto(s) fora: " + "; ".join(partes) + "."
+
     def pergunta(self, dia: Dia) -> str:
-        """O que o Jarvis fala e escreve às 17:00."""
+        """O que o Jarvis fala e escreve na sexta."""
         onde = "homologação" if self.modo == "homologacao" else "produção"
-        base = f"Inventário de hoje pronto: {resumir(self.linhas)}"
-        if not self.digitacao.pronta:
-            return f"{base} A lista está na pasta do dia. {self.digitacao.recusa()}"
+        base = (f"Inventário da semana pronto: {resumir(self.linhas)} Faixa de documentos {dia.faixa}. "
+                f"{self.texto_das_exclusoes()}")  # fmt: skip
+        if not self.importacao.pronta:
+            return f"{base} O arquivo está na pasta da semana. {self.importacao.recusa()}"
         self.aprovacao.pedir(impressao_da_lista(self.linhas))
         dia.pedido_em = datetime.now().isoformat(timespec="seconds")
         self.registro.gravar(dia)
-        return f"{base} Posso digitar no Protheus de {onde}? Responda com /inventario aprovar nos próximos {self.aprovacao.minutos} minutos."
+        return f"{base} Posso importar no Protheus de {onde}? Responda com /inventario aprovar nos próximos {self.aprovacao.minutos} minutos."
 
     def aprovar(self) -> str:
-        """O Bruno digitou a aprovação. Só aqui a digitação pode começar."""
+        """A primeira aprovação: libera a importação do arquivo. Não libera o acerto."""
         dia = self.registro.ler()
         if dia is None or not self.linhas:
-            raise ErroInventario("não há lista montada para hoje. Rode /inventario primeiro.")
+            raise ErroInventario("não há arquivo montado para esta semana. Rode /inventario montar primeiro.")
         vale, por_que = self.aprovacao.vale_para(impressao_da_lista(self.linhas))
         if not vale:
             raise ErroInventario(f"não posso usar essa aprovação: {por_que}.")
         dia.estado = "aprovado"
-        dia.passos.append(f"{datetime.now():%H:%M} aprovado pelo Bruno")
+        dia.passos.append(f"{datetime.now():%H:%M} importação aprovada pelo Bruno")
         self.registro.gravar(dia)
         try:
-            self.digitacao.executar(self.linhas)
+            self.importacao.executar(self.linhas)
         except ErroInventario as erro:
             dia.estado, dia.motivo = "parado", str(erro)
             dia.passos.append(f"{datetime.now():%H:%M} parou: {erro}")
             self.registro.gravar(dia)
-            relatorio(dia, self.linhas, self.modo, self.registro.pasta_do_dia())
+            relatorio(dia, self.linhas, self.modo, self.registro.pasta_do_dia(), self.fora)
             raise
-        dia.estado, dia.confirmados = "concluido", len(self.linhas)
+        dia.estado, dia.confirmados = "importado", len(self.linhas)
         self.registro.gravar(dia)
-        relatorio(dia, self.linhas, self.modo, self.registro.pasta_do_dia())
-        return f"Inventário concluído: {dia.confirmados} de {dia.itens} itens."
+        relatorio(dia, self.linhas, self.modo, self.registro.pasta_do_dia(), self.fora)
+        return f"Importação concluída: {dia.confirmados} linhas. O acerto é à parte: /inventario acertar."
+
+    def acertar(self) -> str:
+        """A segunda aprovação, só para o acerto. É o passo que muda saldo e custo."""
+        dia = self.registro.ler()
+        if dia is None:
+            raise ErroInventario("não há inventário desta semana.")
+        if dia.acerto_feito:
+            raise ErroInventario(f"o acerto desta semana já foi feito (faixa {dia.faixa}). Duas vezes, não.")
+        if dia.estado != "importado":
+            raise ErroInventario(
+                f"o inventário está em '{dia.estado}'. O acerto só depois da importação conferida: "
+                "é ele que mexe em saldo e custo."
+            )
+        self.acerto.executar(dia)  # hoje sempre recusa; quando existir, para antes do clique
+        dia.acerto_feito = True
+        self.registro.gravar(dia)
+        relatorio(dia, self.linhas, self.modo, self.registro.pasta_do_dia(), self.fora)
+        return "Acerto concluído."
 
     def situacao(self) -> str:
         if not self.ligado:
-            return "Inventário diário desligado (JARVIS_INV_MODO=desligado no .env)."
+            return "Inventário semanal desligado (JARVIS_INV_MODO=desligado no .env)."
         if not self.fluxo.pronto:
-            return f"Inventário diário em {self.modo}, mas não consigo ler o Fluxo: {self.fluxo.falta()}."
+            return f"Inventário semanal em {self.modo}, mas não consigo ler o Fluxo: {self.fluxo.falta()}."
         dia = self.registro.ler()
         onde = self.registro.pasta_do_dia()
-        agora = f"Hoje: {dia.estado}, {dia.itens} itens, documento {dia.documento}." if dia else "Hoje: ainda não montei a lista."
-        falta = "" if self.digitacao.pronta else f" {self.digitacao.recusa()}"
-        return f"Inventário diário em {self.modo}, armazém {ARMAZEM}, teto de {self.maximo} itens. {agora} Pasta: {onde}.{falta}"
+        if dia:
+            agora = (f"Esta semana: {dia.estado}, {dia.itens} itens, faixa {dia.faixa}"
+                     + (", acerto feito." if dia.acerto_feito else ", acerto pendente."))  # fmt: skip
+        else:
+            agora = "Esta semana: ainda não montei o arquivo."
+        falta = "" if self.importacao.pronta else f" {self.importacao.recusa()}"
+        return (f"Inventário semanal em {self.modo}, armazém {ARMAZEM}, teto de {self.maximo} itens. "
+                f"{agora} Pasta: {onde}. Exclusões: {self.arquivo_de_exclusoes}.{falta}")  # fmt: skip
